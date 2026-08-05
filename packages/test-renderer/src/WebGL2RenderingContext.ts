@@ -722,7 +722,9 @@ export class WebGL2RenderingContext {
     this.drawingBufferHeight = canvas.height
 
     for (const method of functions) {
-      this[method] ??= () => {}
+      // three keys internal caches (currentDrawbuffers, bindingStates, …) off the handles
+      // gl.create*() returns, so those have to be objects — a WeakMap rejects undefined.
+      this[method] ??= method.startsWith('create') ? () => ({}) : () => {}
     }
 
     Object.assign(this, enums)
