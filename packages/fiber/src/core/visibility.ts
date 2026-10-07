@@ -278,10 +278,11 @@ export function updateVisibilityHandlers(
 
   entry.handlers = handlers
 
-  // Occlusion may have been switched on by this update (e.g. onVisible added alongside onFramed)
-  if ((handlers.onOccluded || handlers.onVisible) && !internal.occlusionEnabled) {
+  // Occlusion may have been switched on by this update (e.g. onVisible added alongside onFramed).
+  // The object needs the flag even when another object already enabled occlusion.
+  if (handlers.onOccluded || handlers.onVisible) {
     ;(object as any).occlusionTest = true
-    enableOcclusion(store)
+    if (!internal.occlusionEnabled) enableOcclusion(store)
   }
 
   return true

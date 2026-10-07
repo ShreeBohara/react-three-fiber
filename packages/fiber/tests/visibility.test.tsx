@@ -6,9 +6,19 @@ import * as React from 'react'
 import { useRef, useEffect } from 'react'
 import { render, act as rtlAct } from '@testing-library/react'
 import { Canvas, useThree, useFrame, extend } from '../src'
-import { __resetWarningFlag } from '../src/core/visibility'
+import {
+  __resetWarningFlag,
+  registerVisibility,
+  updateVisibilityHandlers,
+  unregisterVisibility,
+  checkVisibility,
+  cleanupHelperGroup,
+} from '../src/core/visibility'
+import { createStore } from '../src/core/store'
+import { registerThree } from '../src/core/three'
+import { webgpuSupport } from '../src/support/webgpu'
 import * as THREE from 'three'
-import type { RootState } from '#types'
+import type { RootState, RootStore } from '#types'
 
 // Reset warning flag before each test to ensure clean state
 beforeEach(() => {
@@ -568,4 +578,167 @@ describe('visibility events', () => {
       warnSpy.mockRestore()
     })
   })
+})
+
+//* Occlusion on a WebGPU root ==============================
+// The Canvas tests above run on the WebGL mock, so enableOcclusion() stops at its warning and the
+// observer is never built. These drive a bare store seeded with the real WebGPU support (node
+// classes from three/webgpu; constructing them needs no device) and a renderer whose isOccluded()
+// is stubbed. That proves the wiring: the observer, the cache it fills, the events read from that
+// cache, and teardown. Whether a GPU occlusion query reports the right answer is Tier 2.
+
+describe('occlusion on a WebGPU root', () => {
+  registerThree(THREE)
+
+  function createOcclusionStore(isOccluded: (object: THREE.Object3D) => boolean = () => false) {
+    const store = createStore(
+      () => {},
+      () => {},
+    )
+    const state = store.getState()
+    store.setState({
+      camera: new THREE.PerspectiveCamera(),
+      frustum: new THREE.Frustum(),
+      rootScene: new THREE.Scene(),
+      renderer: { isOccluded } as any,
+      internal: { ...state.internal, support: webgpuSupport },
+    } as any)
+    return store
+  }
+
+  // What three's render pass does each frame: run the observer node's update
+  function renderPass(store: RootStore) {
+    const { internal, renderer } = store.getState()
+    ;(internal.occlusionObserver!.material as any).colorNode.update({ renderer })
+  }
+
+  it('flags an object for occlusion queries when onOccluded is added after occlusion is already on', () => {
+    const store = createOcclusionStore()
+    const first = new THREE.Mesh(new THREE.BoxGeometry())
+    const second = new THREE.Mesh(new THREE.BoxGeometry())
+
+    // `first` turns occlusion on; `second` starts with only onFramed
+    registerVisibility(store, first, { onVisible: () => {} })
+    registerVisibility(store, second, { onFramed: () => {} })
+    expect(store.getState().internal.occlusionEnabled).toBe(true)
+
+    // A prop update on the mounted object, as applyProps does it
+    updateVisibilityHandlers(store, second, { onFramed: () => {}, onOccluded: () => {} })
+
+    // three only issues an occlusion query for objects with occlusionTest === true
+    expect((second as any).occlusionTest).toBe(true)
+  })
+
+  it('builds one observer mesh in the internal helper group', () => {
+    const store = createOcclusionStore()
+    registerVisibility(store, new THREE.Mesh(), { onOccluded: () => {} })
+    registerVisibility(store, new THREE.Mesh(), { onVisible: () => {} })
+
+    const { internal, rootScene } = store.getState()
+    expect(internal.occlusionEnabled).toBe(true)
+    expect(internal.helperGroup!.parent).toBe(rootScene)
+    expect(internal.helperGroup!.children).toEqual([internal.occlusionObserver])
+
+    const observer = internal.occlusionObserver!
+    expect(observer.name).toBe('__r3fOcclusionObserver')
+    // Culling it would stop the node update that fills the cache
+    expect(observer.frustumCulled).toBe(false)
+    expect(observer.material).toBeInstanceOf(webgpuSupport.occlusion.MeshBasicNodeMaterial)
+  })
+
+  it('queries only objects with occlusion handlers during the render pass', () => {
+    const isOccluded = vi.fn(() => true)
+    const store = createOcclusionStore(isOccluded)
+    const occluded = new THREE.Mesh()
+    const framedOnly = new THREE.Mesh()
+    registerVisibility(store, occluded, { onOccluded: () => {} })
+    registerVisibility(store, framedOnly, { onFramed: () => {} })
+
+    renderPass(store)
+
+    expect(isOccluded).toHaveBeenCalledTimes(1)
+    expect(isOccluded).toHaveBeenCalledWith(occluded)
+    const { occlusionCache } = store.getState().internal
+    expect(occlusionCache.get(occluded)).toBe(true)
+    expect(occlusionCache.has(framedOnly)).toBe(false)
+  })
+
+  it('fires onOccluded from the render pass result, only when it changes', () => {
+    let occluded = true
+    const store = createOcclusionStore(() => occluded)
+    const mesh = new THREE.Mesh()
+    const onOccluded = vi.fn()
+    registerVisibility(store, mesh, { onOccluded })
+
+    // No render pass yet: nothing is known, nothing fires
+    checkVisibility(store.getState())
+    expect(onOccluded).not.toHaveBeenCalled()
+
+    renderPass(store)
+    checkVisibility(store.getState())
+    renderPass(store)
+    checkVisibility(store.getState())
+    expect(onOccluded.mock.calls).toEqual([[true]])
+
+    occluded = false
+    renderPass(store)
+    checkVisibility(store.getState())
+    expect(onOccluded.mock.calls).toEqual([[true], [false]])
+  })
+
+  it('onVisible is false while occluded, even inside the frustum', () => {
+    let occluded = true
+    const store = createOcclusionStore(() => occluded)
+    const { camera } = store.getState()
+    camera.position.set(0, 0, 5)
+    camera.updateMatrixWorld()
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry())
+    mesh.updateMatrixWorld()
+    const onVisible = vi.fn()
+    registerVisibility(store, mesh, { onVisible })
+
+    renderPass(store)
+    checkVisibility(store.getState())
+    expect(onVisible.mock.calls).toEqual([[false]])
+
+    occluded = false
+    renderPass(store)
+    checkVisibility(store.getState())
+    expect(onVisible.mock.calls).toEqual([[false], [true]])
+  })
+
+  it('drops an unregistered object from the cache', () => {
+    const store = createOcclusionStore(() => true)
+    const mesh = new THREE.Mesh()
+    registerVisibility(store, mesh, { onOccluded: () => {} })
+    renderPass(store)
+    expect(store.getState().internal.occlusionCache.has(mesh)).toBe(true)
+
+    unregisterVisibility(store, mesh)
+    expect(store.getState().internal.occlusionCache.has(mesh)).toBe(false)
+  })
+
+  it('tears the observer down and disposes it on cleanup', () => {
+    const store = createOcclusionStore(() => true)
+    registerVisibility(store, new THREE.Mesh(), { onOccluded: () => {} })
+    renderPass(store)
+
+    const { occlusionObserver, helperGroup } = store.getState().internal
+    const disposeGeometry = vi.spyOn(occlusionObserver!.geometry, 'dispose')
+    const disposeMaterial = vi.spyOn(occlusionObserver!.material as THREE.Material, 'dispose')
+
+    cleanupHelperGroup(store)
+
+    const { internal, rootScene } = store.getState()
+    expect(disposeGeometry).toHaveBeenCalledTimes(1)
+    expect(disposeMaterial).toHaveBeenCalledTimes(1)
+    expect(occlusionObserver!.parent).toBeNull()
+    expect(rootScene.children).not.toContain(helperGroup)
+    expect(internal.occlusionEnabled).toBe(false)
+    expect(internal.occlusionObserver).toBeNull()
+    expect(internal.helperGroup).toBeNull()
+    expect(internal.occlusionCache.size).toBe(0)
+  })
+
+  it.todo('covered by Tier 2: a real occlusion query reports a mesh hidden behind another as occluded')
 })
